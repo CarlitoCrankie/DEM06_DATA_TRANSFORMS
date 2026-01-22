@@ -1,0 +1,22 @@
+FROM apache/airflow:2.7.3-python3.10
+
+USER root
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    gcc \
+    default-libmysqlclient-dev \
+    pkg-config \
+    && rm -rf /var/lib/apt/lists/*
+
+USER airflow
+
+# Install Python packages
+RUN pip install --no-cache-dir \
+    apache-airflow-providers-mysql==5.5.0 \
+    apache-airflow-providers-postgres==5.10.0 \
+    pandas==2.0.3 \
+    sqlalchemy==1.4.50 \
+    mysqlclient==2.2.0 \
+    psycopg2-binary==2.9.9 \
+    dbt-postgres==1.7.4
