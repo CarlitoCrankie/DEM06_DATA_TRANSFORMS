@@ -1,0 +1,36 @@
+# Logs
+logs/
+*.log
+
+# DBT artifacts (generated files)
+dbt_project/target/
+dbt_project/logs/
+dbt_project/dbt_packages/
+dbt_project/.user.yml
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+.Python
+*.so
+
+# Environment
+.env
+*.env
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Docker
+*.pid
+
+# Data files (optional - uncomment if you don't want to track the CSV)
+# data/*.csv
