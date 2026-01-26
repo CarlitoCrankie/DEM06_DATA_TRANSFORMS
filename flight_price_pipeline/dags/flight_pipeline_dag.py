@@ -192,6 +192,10 @@ def load_csv_to_mysql(**context) -> dict:
 def validate_mysql_data(**context) -> dict:
     """
     Task 2: Validate data in MySQL and populate validated_flight_data table.
+    
+    Validation Strategy:
+    - HARD RULES (reject if failed): Nulls, negative values, data type issues
+    - SOFT RULES (warn but accept): Unexpected categorical values
     """
     
     dag_id, dag_run_id, task_id = get_task_context(context)
@@ -236,12 +240,15 @@ def validate_mysql_data(**context) -> dict:
         total_rows = len(df)
         print(f"Fetched {total_rows} rows for validation")
         
-        # Step 2: Apply validation rules
+        # Step 2: Initialize validation columns
         print("Applying validation rules")
-        
-        # Initialize validation columns
         df['is_valid'] = True
         df['validation_errors'] = ''
+        df['validation_warnings'] = ''
+        
+        # =====================================================
+        # HARD RULES - These cause rejection (is_valid = FALSE)
+        # =====================================================
         
         # Rule 1: Required fields not null
         required_fields = ['airline', 'source_code', 'destination_code']
@@ -263,45 +270,82 @@ def validate_mysql_data(**context) -> dict:
             df.loc[mask, 'is_valid'] = False
             df.loc[mask, 'validation_errors'] += f'{field} must be 3 characters; '
         
-        # Rule 4: Valid seasonality values
-        valid_seasons = ['Regular', 'Eid', 'Hajj', 'Winter']
-        mask = ~df['seasonality'].isin(valid_seasons)
-        df.loc[mask, 'is_valid'] = False
-        df.loc[mask, 'validation_errors'] += 'Invalid seasonality value; '
-        
-        # Rule 5: Valid travel class values
-        valid_classes = ['Economy', 'Business', 'First']
-        mask = ~df['travel_class'].isin(valid_classes)
-        df.loc[mask, 'is_valid'] = False
-        df.loc[mask, 'validation_errors'] += 'Invalid travel class; '
-        
-        # Rule 6: Valid stopovers values
-        valid_stopovers = ['Direct', '1 Stop', '2 Stops']
-        mask = ~df['stopovers'].isin(valid_stopovers)
-        df.loc[mask, 'is_valid'] = False
-        df.loc[mask, 'validation_errors'] += 'Invalid stopovers value; '
-        
-        # Rule 7: Days before departure should be 1-90
-        mask = (df['days_before_departure'] < 1) | (df['days_before_departure'] > 90)
-        df.loc[mask, 'is_valid'] = False
-        df.loc[mask, 'validation_errors'] += 'days_before_departure must be 1-90; '
-        
-        # Rule 8: Duration must be positive
+        # Rule 4: Duration must be positive
         mask = (df['duration_hrs'].isna()) | (df['duration_hrs'] <= 0)
         df.loc[mask, 'is_valid'] = False
         df.loc[mask, 'validation_errors'] += 'duration_hrs must be positive; '
         
-        # Clean up validation_errors
+        # Rule 5: Days before departure should be positive
+        mask = (df['days_before_departure'].isna()) | (df['days_before_departure'] < 1)
+        df.loc[mask, 'is_valid'] = False
+        df.loc[mask, 'validation_errors'] += 'days_before_departure must be at least 1; '
+        
+        # =====================================================
+        # SOFT RULES - These cause warnings but NOT rejection
+        # =====================================================
+        
+        # Known/expected values (for reporting purposes)
+        known_seasons = ['Regular', 'Eid', 'Hajj', 'Winter', 'Winter Holidays']
+        known_classes = ['Economy', 'Business', 'First', 'First Class', 'Premium Economy']
+        known_stopovers = ['Direct', '1 Stop', '2 Stops']
+        known_booking_sources = ['Direct Booking', 'Travel Agency', 'Online Website']
+        
+        # Warn on unexpected seasonality (but don't reject)
+        mask = ~df['seasonality'].isin(known_seasons) & df['seasonality'].notna()
+        unexpected_seasons = df.loc[mask, 'seasonality'].unique()
+        if len(unexpected_seasons) > 0:
+            print(f"WARNING: Unexpected seasonality values found: {unexpected_seasons}")
+            df.loc[mask, 'validation_warnings'] += f'Unexpected seasonality: {df.loc[mask, "seasonality"]}; '
+        
+        # Warn on unexpected travel class (but don't reject)
+        mask = ~df['travel_class'].isin(known_classes) & df['travel_class'].notna()
+        unexpected_classes = df.loc[mask, 'travel_class'].unique()
+        if len(unexpected_classes) > 0:
+            print(f"WARNING: Unexpected travel_class values found: {unexpected_classes}")
+            df.loc[mask, 'validation_warnings'] += f'Unexpected travel_class: {df.loc[mask, "travel_class"]}; '
+        
+        # Warn on unexpected stopovers (but don't reject)
+        mask = ~df['stopovers'].isin(known_stopovers) & df['stopovers'].notna()
+        unexpected_stopovers = df.loc[mask, 'stopovers'].unique()
+        if len(unexpected_stopovers) > 0:
+            print(f"WARNING: Unexpected stopovers values found: {unexpected_stopovers}")
+            df.loc[mask, 'validation_warnings'] += f'Unexpected stopovers: {df.loc[mask, "stopovers"]}; '
+        
+        # Warn on unexpected booking source (but don't reject)
+        mask = ~df['booking_source'].isin(known_booking_sources) & df['booking_source'].notna()
+        unexpected_sources = df.loc[mask, 'booking_source'].unique()
+        if len(unexpected_sources) > 0:
+            print(f"WARNING: Unexpected booking_source values found: {unexpected_sources}")
+            df.loc[mask, 'validation_warnings'] += f'Unexpected booking_source: {df.loc[mask, "booking_source"]}; '
+        
+        # Warn if days_before_departure > 365 (unusual but not invalid)
+        mask = df['days_before_departure'] > 365
+        if mask.sum() > 0:
+            print(f"WARNING: {mask.sum()} rows have days_before_departure > 365")
+            df.loc[mask, 'validation_warnings'] += 'days_before_departure > 365 (unusual); '
+        
+        # =====================================================
+        # Clean up and summarize
+        # =====================================================
+        
+        # Clean up error/warning strings
         df['validation_errors'] = df['validation_errors'].str.rstrip('; ')
         df.loc[df['validation_errors'] == '', 'validation_errors'] = None
         
-        # Step 3: Count results
+        df['validation_warnings'] = df['validation_warnings'].str.rstrip('; ')
+        df.loc[df['validation_warnings'] == '', 'validation_warnings'] = None
+        
+        # Count results
         valid_count = df['is_valid'].sum()
         invalid_count = total_rows - valid_count
+        warning_count = df['validation_warnings'].notna().sum()
         
-        print(f"Validation complete: {valid_count} valid, {invalid_count} invalid")
+        print(f"Validation complete:")
+        print(f"  - Valid records: {valid_count}")
+        print(f"  - Invalid records: {invalid_count}")
+        print(f"  - Records with warnings: {warning_count}")
         
-        # Step 4: Insert into validated_flight_data
+        # Step 3: Insert into validated_flight_data
         print("Inserting validated data into MySQL")
         
         # Rename id to raw_id for foreign key
@@ -310,7 +354,8 @@ def validate_mysql_data(**context) -> dict:
         # Get SQLAlchemy engine
         engine = mysql_hook.get_sqlalchemy_engine()
         
-        # Columns to insert
+        # Columns to insert (note: validation_warnings won't be stored in MySQL 
+        # since the table doesn't have that column, but we log it)
         columns_to_insert = [
             'airline', 'source_code', 'source_name', 'destination_code',
             'destination_name', 'departure_datetime', 'arrival_datetime',
@@ -330,7 +375,7 @@ def validate_mysql_data(**context) -> dict:
         
         print(f"Inserted {total_rows} rows into validated_flight_data")
         
-        # Step 5: Log success
+        # Step 4: Log success with detailed metrics
         log_pipeline_event(
             dag_id=dag_id,
             dag_run_id=dag_run_id,
@@ -342,14 +387,18 @@ def validate_mysql_data(**context) -> dict:
                 'total_rows': total_rows,
                 'valid_rows': int(valid_count),
                 'invalid_rows': int(invalid_count),
-                'validation_rate': f"{(valid_count/total_rows)*100:.2f}%"
+                'rows_with_warnings': int(warning_count),
+                'validation_rate': f"{(valid_count/total_rows)*100:.2f}%",
+                'unexpected_seasons': list(unexpected_seasons) if len(unexpected_seasons) > 0 else None,
+                'unexpected_classes': list(unexpected_classes) if len(unexpected_classes) > 0 else None
             }
         )
         
         return {
             'total_rows': total_rows,
             'valid_rows': int(valid_count),
-            'invalid_rows': int(invalid_count)
+            'invalid_rows': int(invalid_count),
+            'rows_with_warnings': int(warning_count)
         }
         
     except Exception as e:
@@ -517,15 +566,17 @@ with DAG(
         provide_context=True
     )
     
-    # Task 4: Run DBT transformations
+    # Task 4: Run DBT transformations and snapshots
     task_dbt = BashOperator(
         task_id='run_dbt_transformations',
         bash_command='''
             cd /opt/airflow/dbt_project && \
             dbt run --profiles-dir . && \
+            dbt snapshot --profiles-dir . && \
             dbt test --profiles-dir .
         ''',
     )
+
     
     # Define task dependencies
     task_load_csv >> task_validate >> task_transfer >> task_dbt

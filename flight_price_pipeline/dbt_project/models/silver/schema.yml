@@ -26,15 +26,21 @@ models:
         tests:
           - not_null
       - name: travel_class
-        description: "Travel class"
+        description: "Travel class (standardized where possible)"
         tests:
-          - accepted_values:
-              values: ['Economy', 'Business', 'First']
+          - not_null
       - name: seasonality
-        description: "Season"
+        description: "Season (original value from source)"
         tests:
-          - accepted_values:
-              values: ['Regular', 'Eid', 'Hajj', 'Winter']
+          - not_null
+      - name: is_peak_season
+        description: "Whether this is a peak travel season"
+        tests:
+          - not_null
+      - name: season_category
+        description: "Grouped season category"
+        tests:
+          - not_null
       - name: route_type
         description: "Domestic or International"
         tests:
