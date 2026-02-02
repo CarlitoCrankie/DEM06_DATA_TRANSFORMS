@@ -10,7 +10,7 @@ An end-to-end data pipeline that processes and analyzes flight price data for Ba
 ## Architecture
 
 ```
-![System Architecture](docs/diagrams/System_architecture.png)
+![System Architecture](System_architecture.png)
 ```
 
 ---
