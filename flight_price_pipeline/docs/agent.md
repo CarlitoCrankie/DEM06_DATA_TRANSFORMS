@@ -66,38 +66,57 @@ flight_price_pipeline/
 │   │   ├── *.dot                      # GraphViz DOT source files
 │   │   └── *.drawio                   # Editable draw.io files
 │   ├── agent.md                       # THIS FILE - Agent instructions
+│   ├── instructions.md                # Complete architecture documentation
 │   ├── requirements.txt               # Python dependencies for diagram generation
 │   └── generate_architecture.py       # Main diagram generation script
 ├── docker-compose.yml                 # Container orchestration
 ├── Dockerfile.airflow                 # Custom Airflow image
-├── .env                               # Environment variables
-├── README.md
+├── README.md                          # Project overview
 ├── dags/
-│   ├── flight_pipeline_dag.py         # Main Airflow DAG
+│   ├── flight_pipeline_dag.py         # Main Airflow DAG with 4 tasks
+│   ├── flight_pipeline_dag copy.py    # Backup copy
+│   ├── __pycache__/
 │   └── utils/
-│       └── logging_utils.py           # Custom logging functions
+│       ├── __init__.py
+│       ├── logging_utils.py           # Logging and context utilities
+│       └── __pycache__/
 ├── dbt_project/
 │   ├── dbt_project.yml                # DBT configuration
 │   ├── profiles.yml                   # Database connections
+│   ├── dbt_packages/                  # Installed DBT packages
 │   ├── models/
-│   │   ├── sources.yml                # Source definitions
-│   │   ├── silver/
-│   │   │   ├── silver_cleaned_flights.sql
-│   │   │   └── schema.yml
-│   │   └── gold/
+│   │   ├── sources.yml                # Source definitions (bronze.validated_flights)
+│   │   ├── bronze/                    # Bronze layer (raw data)
+│   │   ├── silver/                    # Silver layer (cleaned data)
+│   │   └── gold/                      # Gold layer (KPI aggregations)
 │   │       ├── gold_avg_fare_by_airline.sql
 │   │       ├── gold_seasonal_fare_analysis.sql
 │   │       ├── gold_booking_count_by_airline.sql
 │   │       ├── gold_popular_routes.sql
 │   │       ├── gold_fare_by_class.sql
 │   │       ├── gold_data_quality_report.sql
-│   │       ├── gold_fare_history.sql
-│   │       ├── gold_route_history.sql
+│   │       ├── gold_fare_history.sql (view)
+│   │       ├── gold_route_history.sql (view)
 │   │       └── schema.yml
 │   ├── snapshots/
-│   │   ├── flight_fare_snapshot.sql
-│   │   └── route_fare_snapshot.sql
-│   └── macros/
+│   │   ├── flight_fare_snapshot.sql   # SCD Type 2 - fare history
+│   │   └── route_fare_snapshot.sql    # SCD Type 2 - route history
+│   ├── macros/
+│   │   └── get_custom_schema.sql      # Custom schema naming macro
+│   ├── tests/                         # Data quality tests
+│   ├── logs/                          # DBT execution logs
+│   └── target/                        # DBT compiled artifacts
+├── data/
+│   └── Flight_Price_Dataset_of_Bangladesh.csv  # Source data (57,000 rows)
+├── scripts/
+│   ├── init_mysql.sql                 # MySQL initialization script
+│   └── init_postgres.sql              # PostgreSQL initialization script
+├── plugins/                           # Airflow plugins directory
+├── logs/                              # Airflow execution logs
+│   ├── dag_id=flight_price_pipeline/  # DAG-specific logs
+│   ├── dag_processor_manager/
+│   └── scheduler/
+└── .env                               # Environment variables
 │       └── get_custom_schema.sql      # Custom schema naming
 ├── data/
 │   └── Flight_Price_Dataset_of_Bangladesh.csv
@@ -325,17 +344,17 @@ Edge(label="Silver → Gold", color="gold", style="solid")
 ## Airflow DAG Tasks to Display
 
 ```python
-# Task 1
-"Task 1: Load CSV to MySQL\n• Read CSV with Pandas\n• Rename columns\n• Insert to raw_flight_data\n• ~8 seconds"
+# Task 1: Load CSV to MySQL
+"Task 1: load_csv_to_mysql\n• Read CSV (57,000 rows)\n• Rename columns to snake_case\n• Convert data types\n• Insert to raw_flight_data\n• Duration: ~8 seconds"
 
-# Task 2
-"Task 2: Validate Data\n• Check required fields\n• Validate positive values\n• Check IATA codes\n• Set is_valid flag\n• ~10 seconds"
+# Task 2: Validate Data
+"Task 2: validate_mysql_data\n• Validate required fields\n• Check positive fare values\n• Validate IATA codes (3 chars)\n• Check positive duration\n• Populate validated_flight_data\n• Duration: ~10 seconds"
 
-# Task 3
-"Task 3: Transfer to PostgreSQL\n• Extract valid records\n• Convert boolean types\n• Load to bronze.validated_flights\n• ~12 seconds"
+# Task 3: Transfer to PostgreSQL
+"Task 3: transfer_to_postgres_bronze\n• Extract valid records (is_valid=1)\n• Convert boolean types\n• Truncate bronze layer\n• Load to bronze.validated_flights\n• Duration: ~12 seconds"
 
-# Task 4
-"Task 4: DBT Run + Snapshot\n• Silver transformations\n• Gold aggregations\n• SCD snapshots\n• ~4 seconds"
+# Task 4: DBT Transformations
+"Task 4: run_dbt_transformations\n• dbt run (Silver & Gold models)\n• dbt test (Data quality tests)\n• dbt snapshot (SCD updates)\n• Duration: ~4 seconds"
 ```
 
 ---
@@ -344,21 +363,21 @@ Edge(label="Silver → Gold", color="gold", style="solid")
 
 ### Bronze Layer
 ```python
-"bronze.validated_flights\n• 57,000 rows\n• Raw validated data\n• No transformations"
+"bronze.validated_flights\n• 57,000 rows\n• Raw validated data\n• All source columns preserved\n• is_valid, validation_errors flags\n• No transformations applied"
 ```
 
 ### Silver Layer
 ```python
-"silver.silver_cleaned_flights\n• Standardized text\n• Derived columns:\n  - route\n  - fare_category\n  - booking_window\n  - route_type\n  - is_peak_season"
+"silver.silver_cleaned_flights\n• 57,000 rows (valid only)\n• Standardized text (UPPER, trim)\n• Derived columns:\n  - route (source-destination)\n  - fare_category\n  - booking_window\n  - route_type\n  - is_peak_season"
 
-"silver.flight_fare_snapshot\n• SCD Type 2\n• 19,052 records\n• Tracks fare changes"
+"silver.flight_fare_snapshot\n• SCD Type 2\n• ~19,052 records\n• Tracks fare changes over time\n• dbt_valid_from/to timestamps"
 
-"silver.route_fare_snapshot\n• SCD Type 2\n• 152 records\n• Tracks route metrics"
+"silver.route_fare_snapshot\n• SCD Type 2\n• ~152 records\n• Tracks route metrics\n• dbt_valid_from/to timestamps"
 ```
 
-### Gold Layer
+### Gold Layer (6 KPI Tables)
 ```python
-"gold.gold_avg_fare_by_airline (24 rows)\ngold.gold_seasonal_fare_analysis (4 rows)\ngold.gold_booking_count_by_airline (24 rows)\ngold.gold_popular_routes (152 rows)\ngold.gold_fare_by_class (3 rows)\ngold.gold_data_quality_report (13 rows)"
+"gold.gold_avg_fare_by_airline (24 rows)\nAverage fare by airline\n\ngold.gold_seasonal_fare_analysis (4 rows)\nFare analysis by season\n\ngold.gold_booking_count_by_airline (24 rows)\nBooking volume by airline\n\ngold.gold_popular_routes (152 rows)\nTop routes by popularity\n\ngold.gold_fare_by_class (3 rows)\nFare statistics by class\n\ngold.gold_data_quality_report (13 rows)\nData quality metrics"
 ```
 
 ---
@@ -421,19 +440,38 @@ Each diagram generation produces 3 files:
 ### Container Hierarchy
 ```
 Docker Environment
-├── Airflow Webserver (:8080)
-├── Airflow Scheduler
+├── Airflow Services
+│   ├── Airflow Webserver (:8080)
+│   └── Airflow Scheduler
+│
 ├── MySQL Staging (:3307)
-│   ├── raw_flight_data
-│   └── validated_flight_data
+│   ├── raw_flight_data (57,000 rows)
+│   └── validated_flight_data (57,000 rows, with validation flags)
+│
 ├── PostgreSQL Analytics (:5433)
-│   ├── bronze.validated_flights
-│   ├── silver.silver_cleaned_flights
-│   ├── silver.flight_fare_snapshot
-│   ├── silver.route_fare_snapshot
-│   ├── gold.* (6 KPI tables)
-│   └── audit.pipeline_runs
-└── DBT (runs inside Airflow container)
+│   ├── bronze schema
+│   │   └── validated_flights (57,000 rows)
+│   ├── silver schema
+│   │   ├── silver_cleaned_flights (57,000 rows)
+│   │   ├── flight_fare_snapshot (SCD Type 2, ~19,052 records)
+│   │   └── route_fare_snapshot (SCD Type 2, ~152 records)
+│   ├── gold schema
+│   │   ├── gold_avg_fare_by_airline
+│   │   ├── gold_seasonal_fare_analysis
+│   │   ├── gold_booking_count_by_airline
+│   │   ├── gold_popular_routes
+│   │   ├── gold_fare_by_class
+│   │   ├── gold_data_quality_report
+│   │   ├── gold_fare_history (view)
+│   │   └── gold_route_history (view)
+│   └── audit schema
+│       └── pipeline_runs (audit trail)
+│
+└── DBT Transformation Engine (runs inside Airflow)
+    ├── Models: 9
+    ├── Tests: 22 (all passing)
+    ├── Snapshots: 2 (SCD Type 2)
+    └── Macros: 1 (custom schema naming)
 ```
 
 ### Data Flow

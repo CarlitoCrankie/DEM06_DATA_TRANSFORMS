@@ -111,39 +111,45 @@ Create a system architecture diagram for a flight price analysis data pipeline u
 Table: raw_flight_data
 ├── id (INT AUTO_INCREMENT PRIMARY KEY)
 ├── airline (VARCHAR(100))
-├── source (VARCHAR(10))
-├── destination (VARCHAR(10))
-├── departure_time (DATETIME)
-├── arrival_time (DATETIME)
-├── duration (INT)
-├── stops (INT)
-├── class (VARCHAR(50))
-├── base_fare (DECIMAL(10,2))
-├── total_fare (DECIMAL(10,2))
-├── seasonality (VARCHAR(50))
-├── booking_lead_time (INT)
-├── booking_source (VARCHAR(50))
-├── flight_number (VARCHAR(20))
+├── source_code (VARCHAR(10))
+├── source_name (VARCHAR(100))
+├── destination_code (VARCHAR(10))
+├── destination_name (VARCHAR(100))
+├── departure_datetime (DATETIME)
+├── arrival_datetime (DATETIME)
+├── duration_hrs (DECIMAL(5,2))
+├── stopovers (VARCHAR(20))
 ├── aircraft_type (VARCHAR(100))
-├── baggage_allowance (INT)
-├── meal_included (TINYINT)
-├── wifi_available (TINYINT)
-└── created_at (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+├── travel_class (VARCHAR(50))
+├── booking_source (VARCHAR(50))
+├── base_fare_bdt (DECIMAL(12,2))
+├── tax_surcharge_bdt (DECIMAL(12,2))
+├── total_fare_bdt (DECIMAL(12,2))
+├── seasonality (VARCHAR(50))
+├── days_before_departure (INT)
+├── source_file (VARCHAR(255))
+├── loaded_at (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+└── PRIMARY KEY (id)
 
 Table: validated_flight_data
-├── (same columns as raw_flight_data)
+├── id (INT AUTO_INCREMENT PRIMARY KEY)
+├── (all raw_flight_data columns except id)
 ├── is_valid (TINYINT)
 ├── validation_errors (TEXT)
-└── validated_at (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
-
-Foreign Key: validated_flight_data.id → raw_flight_data.id
+├── validation_warnings (TEXT)
+├── raw_id (INT)
+├── validated_at (TIMESTAMP DEFAULT CURRENT_TIMESTAMP)
+├── PRIMARY KEY (id)
+├── FOREIGN KEY (raw_id) REFERENCES raw_flight_data(id)
+└── INDEX (is_valid), INDEX (raw_id)
 ```
 
 **Purpose**:
 ```
-• Landing zone for CSV data
-• Data validation staging
-• Separation of raw and validated data
+• Landing zone for CSV data (raw_flight_data)
+• Validation staging area (validated_flight_data)
+• Separation of concerns: raw vs. validated
+• Audit trail with timestamps and validation flags
 ```
 
 ---
@@ -156,12 +162,88 @@ Foreign Key: validated_flight_data.id → raw_flight_data.id
 - **Password**: `analytics_pass`
 - **Initialization**: `./scripts/init_postgres.sql`
 
-**Schemas**:
+**Schemas and Objects**:
 ```
-├── bronze (raw validated data)
-├── silver (cleaned and transformed data)
-├── gold (aggregated KPIs)
-└── audit (pipeline monitoring)
+├── bronze schema (Raw layer)
+│   └── validated_flights (57,000 rows)
+│       ├── All validated columns from MySQL
+│       ├── is_valid, validation_errors
+│       ├── mysql_raw_id, mysql_validated_id
+│       ├── mysql_loaded_at, bronze_loaded_at
+│       └── NO transformations applied
+│
+├── silver schema (Cleaned layer)
+│   ├── silver_cleaned_flights (57,000 rows)
+│   │   ├── All bronze columns plus derived columns:
+│   │   │   - route (source_code || '-' || destination_code)
+│   │   │   - fare_category (Budget/Standard/Premium)
+│   │   │   - booking_window (Last Minute/Standard/Advance/Early Bird)
+│   │   │   - route_type (Domestic/International)
+│   │   │   - is_peak_season (boolean)
+│   │   ├── Standardized text (UPPER case, trim whitespace)
+│   │   └── Valid records only (is_valid=1)
+│   │
+│   ├── flight_fare_snapshot (SCD Type 2, ~19,052 rows)
+│   │   ├── Tracks: airline, route, class, seasonality combinations
+│   │   ├── Metrics: avg_base_fare, avg_total_fare, booking_count
+│   │   ├── SCD Columns: dbt_valid_from, dbt_valid_to, dbt_scd_id, dbt_updated_at
+│   │   └── Strategy: check (monitors specific columns for changes)
+│   │
+│   └── route_fare_snapshot (SCD Type 2, ~152 rows)
+│       ├── Tracks: route-level metrics
+│       ├── Metrics: avg_fare, total_bookings, airline_count
+│       ├── SCD Columns: dbt_valid_from, dbt_valid_to, dbt_scd_id, dbt_updated_at
+│       └── Strategy: check
+│
+├── gold schema (KPI/Analytics layer)
+│   ├── gold_avg_fare_by_airline (24 rows)
+│   │   ├── airline, avg_fare, min_fare, max_fare, median_fare
+│   │   ├── booking_count, market_share
+│   │   └── Aggregation: GROUP BY airline
+│   │
+│   ├── gold_seasonal_fare_analysis (4 rows)
+│   │   ├── seasonality, avg_fare, booking_count
+│   │   ├── pct_diff_from_regular
+│   │   └── Aggregation: GROUP BY seasonality
+│   │
+│   ├── gold_booking_count_by_airline (24 rows)
+│   │   ├── airline, booking_source, booking_window
+│   │   ├── booking_count, total_revenue
+│   │   └── Aggregation: GROUP BY airline, booking_source, booking_window
+│   │
+│   ├── gold_popular_routes (152 rows)
+│   │   ├── source, destination, airline
+│   │   ├── booking_count, avg_fare, flight_count
+│   │   └── Aggregation: GROUP BY route, airline (ordered by booking_count)
+│   │
+│   ├── gold_fare_by_class (3 rows)
+│   │   ├── travel_class, avg_fare, min_fare, max_fare
+│   │   ├── booking_count, revenue_share
+│   │   └── Aggregation: GROUP BY travel_class
+│   │
+│   ├── gold_data_quality_report (13 rows)
+│   │   ├── metric_name, metric_value, percentage
+│   │   └── Tracks: categorical value distributions
+│   │
+│   ├── gold_fare_history (view)
+│   │   ├── Joins flight_fare_snapshot with current data
+│   │   ├── Shows historical fare changes over time
+│   │   └── Includes valid_from, valid_to dates
+│   │
+│   └── gold_route_history (view)
+│       ├── Joins route_fare_snapshot with current data
+│       ├── Shows historical route metric changes
+│       └── Includes valid_from, valid_to dates
+│
+└── audit schema (Monitoring/Logging layer)
+    └── pipeline_runs (log entries)
+        ├── run_id (uuid)
+        ├── dag_id, task_id (varchar)
+        ├── status (started/completed/failed)
+        ├── rows_processed, rows_failed (int)
+        ├── started_at, completed_at (timestamp)
+        ├── error_message (text)
+        └── metadata (jsonb)
 ```
 
 ---
@@ -170,31 +252,90 @@ Foreign Key: validated_flight_data.id → raw_flight_data.id
 - **Location**: Runs inside Airflow container
 - **Project Path**: `/opt/airflow/dbt_project`
 - **Version**: 1.7.4
-- **Profile**: `flight_analytics`
+- **Database Profile**: `flight_analytics` (PostgreSQL)
+- **Threads**: 4
+
+**Configuration**:
+```yaml
+dbt_project.yml:
+  name: flight_analytics
+  version: 1.0.0
+  config-version: 2
+  
+profiles.yml:
+  flight_analytics:
+    outputs:
+      postgres:
+        type: postgres
+        host: postgres-analytics
+        port: 5432
+        database: flight_analytics
+        schema: "{{ env_var('DBT_SCHEMA', 'analytics') }}"
+```
 
 **Models (9 total)**:
-```
-Silver Layer:
-├── silver_cleaned_flights.sql
 
-Gold Layer:
-├── gold_avg_fare_by_airline.sql
-├── gold_seasonal_fare_analysis.sql
-├── gold_booking_count_by_airline.sql
-├── gold_popular_routes.sql
-├── gold_fare_by_class.sql
-├── gold_data_quality_report.sql
-├── gold_fare_history.sql (view)
-└── gold_route_history.sql (view)
-```
+**Bronze Layer**:
+- No models - data loaded directly from MySQL
 
-**Snapshots (2 total)**:
-```
-├── flight_fare_snapshot.sql (19,052 records)
-└── route_fare_snapshot.sql (152 records)
-```
+**Silver Layer**:
+- `silver_cleaned_flights.sql` (table, 57,000 rows)
+  - Cleaning and standardization
+  - Derived columns (route, fare_category, booking_window, etc.)
+  - Source: bronze.validated_flights
 
-**Tests**: 22 (all passing)
+**Gold Layer (6 KPI tables)**:
+- `gold_avg_fare_by_airline.sql` (table, 24 rows)
+- `gold_seasonal_fare_analysis.sql` (table, 4 rows)
+- `gold_booking_count_by_airline.sql` (table, 24 rows)
+- `gold_popular_routes.sql` (table, 152 rows)
+- `gold_fare_by_class.sql` (table, 3 rows)
+- `gold_data_quality_report.sql` (table, 13 rows)
+
+**Views (2)**:
+- `gold_fare_history.sql` (view)
+  - Historical fare tracking via snapshot
+- `gold_route_history.sql` (view)
+  - Historical route metric tracking via snapshot
+
+**Snapshots (2 total - SCD Type 2)**:
+
+1. `flight_fare_snapshot.sql`
+   ```yaml
+   unique_key: [airline, source_code, destination_code, travel_class, seasonality]
+   check_cols: [avg_base_fare, avg_total_fare, booking_count]
+   strategy: check
+   updated_at: current_timestamp
+   ```
+   - Records: ~19,052
+   - Tracks fare changes over time
+   - SCD Columns: dbt_valid_from, dbt_valid_to, dbt_scd_id, dbt_updated_at
+
+2. `route_fare_snapshot.sql`
+   ```yaml
+   unique_key: [source_code, destination_code]
+   check_cols: [avg_fare, total_bookings, airline_count]
+   strategy: check
+   updated_at: current_timestamp
+   ```
+   - Records: ~152
+   - Tracks route metrics over time
+   - SCD Columns: dbt_valid_from, dbt_valid_to, dbt_scd_id, dbt_updated_at
+
+**Tests (22 total - all passing)**:
+- Uniqueness tests on primary keys
+- Not null tests on required fields
+- Relationship tests for foreign keys
+- Custom validation tests
+- dbt_expectations (Great Expectations integration)
+
+**Macros (1)**:
+- `get_custom_schema.sql` - Custom schema naming macro
+
+**Packages**:
+- dbt-utils (utility functions)
+- dbt-expectations (data quality)
+- dbt-audit-helper (auditing utilities)
 
 ---
 
@@ -209,61 +350,151 @@ Gold Layer:
 **Process**:
 ```
 1. Read CSV with Pandas
-2. Rename columns to snake_case
-3. Convert data types
-4. Truncate existing table (with FK checks disabled)
-5. Insert records in batches
-6. Log row count to audit table
+2. Rename columns to snake_case according to COLUMN_MAPPING
+3. Convert data types (datetime, numeric)
+4. Add source_file column
+5. Check for NULL values (logging)
+6. Truncate existing tables (with FK checks disabled)
+7. Insert records in batches (BATCH_SIZE=5000)
+8. Log pipeline event with row count and NULL statistics
 ```
 
-### Task 2: Validate Data
-- **Task ID**: `validate_data`
+**Return Value**:
+```python
+{
+    'rows_loaded': 57000,
+    'rows_with_issues': 0
+}
+```
+
+---
+
+### Task 2: Validate MySQL Data
+- **Task ID**: `validate_mysql_data`
 - **Duration**: ~10 seconds
 - **Input**: MySQL `raw_flight_data`
 - **Output**: MySQL `validated_flight_data`
 
 **Validation Rules**:
-```
-Hard Rules (reject if failed):
-• Required fields not null (airline, source, destination)
-• Positive fare values (base_fare > 0, total_fare > 0)
-• Valid IATA codes (3 characters)
-• Positive duration (duration > 0)
-• Positive booking lead time (booking_lead_time >= 0)
 
-Soft Rules (accept with warning):
-• Unexpected seasonality values (logged but accepted)
-• Unexpected class values (logged but accepted)
+**Hard Rules** (rows fail if not met):
+```
+• Required fields not null or empty:
+  - airline, source_code, destination_code
+• Positive fare values:
+  - base_fare_bdt > 0
+  - total_fare_bdt > 0
+• Non-negative tax/surcharge:
+  - tax_surcharge_bdt >= 0
+• IATA code format (3 characters):
+  - source_code, destination_code
+• Positive duration:
+  - duration_hrs > 0
+• Positive booking lead time:
+  - days_before_departure >= 1
 ```
 
-### Task 3: Transfer to PostgreSQL
-- **Task ID**: `transfer_to_postgres`
+**Soft Rules** (logged warnings but records pass):
+```
+• Unexpected seasonality values
+  Known: Regular, Eid, Hajj, Winter, Winter Holidays
+• Unexpected travel_class values
+  Known: Economy, Business, First, First Class, Premium Economy
+• Unexpected stopovers values
+  Known: Direct, 1 Stop, 2 Stops
+• Unexpected booking_source values
+  Known: Direct Booking, Travel Agency, Online Website
+• Unusual days_before_departure (> 365)
+```
+
+**Output Columns**:
+```
+All source columns plus:
+• is_valid (1=valid, 0=invalid)
+• validation_errors (concatenated error messages)
+• validation_warnings (concatenated warning messages)
+• raw_id (foreign key to raw_flight_data)
+```
+
+**Return Value**:
+```python
+{
+    'total_rows': 57000,
+    'valid_rows': 57000,
+    'invalid_rows': 0,
+    'rows_with_warnings': 0
+}
+```
+
+---
+
+### Task 3: Transfer to PostgreSQL Bronze
+- **Task ID**: `transfer_to_postgres_bronze`
 - **Duration**: ~12 seconds
 - **Input**: MySQL `validated_flight_data` (valid records only)
 - **Output**: PostgreSQL `bronze.validated_flights`
 
 **Process**:
 ```
-1. Extract valid records (is_valid = 1)
-2. Convert boolean types (TINYINT → BOOLEAN)
-3. Truncate target table
-4. Insert records via JDBC
-5. Log transfer statistics
+1. Extract validated data from MySQL with joins
+   - Include raw_id and mysql_validated_id for traceability
+   - Only where is_valid = 1
+2. Convert TINYINT is_valid to BOOLEAN
+3. Add bronze_loaded_at timestamp
+4. Connect to PostgreSQL analytics database
+5. Truncate existing bronze table
+6. Insert records in batches (BATCH_SIZE=5000)
+7. Verify row count matches source count
+8. Log transfer statistics
 ```
 
-### Task 4: DBT Run + Snapshot
-- **Task ID**: `dbt_run_and_snapshot`
+**Return Value**:
+```python
+{
+    'rows_transferred': 57000
+}
+```
+
+---
+
+### Task 4: Run DBT Transformations
+- **Task ID**: `run_dbt_transformations`
 - **Duration**: ~4 seconds
-- **Input**: PostgreSQL Bronze layer
+- **Input**: PostgreSQL `bronze.validated_flights`
 - **Output**: Silver and Gold layers
 
-**Process**:
+**Execution Order**:
 ```
-1. Run dbt deps (install packages)
-2. Run dbt run (execute models)
-3. Run dbt snapshot (update SCD tables)
-4. Run dbt test (validate results)
-5. Log model statistics
+1. dbt run (--profiles-dir .)
+   ├─ Creates/updates Silver models
+   ├─ Creates/updates Gold models
+   └─ Returns model execution results
+
+2. dbt test (--profiles-dir .)
+   ├─ Runs all data quality tests
+   └─ Returns test results
+
+3. dbt snapshot (--profiles-dir .)
+   ├─ Updates flight_fare_snapshot
+   ├─ Updates route_fare_snapshot
+   └─ Returns snapshot execution results
+```
+
+**Error Handling**:
+```
+• If any step fails, logs error and raises exception
+• Captures stdout/stderr (first 2000 chars)
+• Records failed_step in metadata
+• Prevents execution of subsequent steps
+```
+
+**Return Value**:
+```python
+{
+    'dbt_run': 'success',
+    'dbt_test': 'success',
+    'dbt_snapshot': 'success'
+}
 ```
 
 ---
@@ -276,95 +507,246 @@ Soft Rules (accept with warning):
 - **Row Count**: 57,000
 - **Purpose**: Raw validated data, unchanged from source
 
-**Columns**:
+**Columns** (all source columns plus audit columns):
 ```
-All 18 source columns plus:
+Core columns from MySQL:
+• airline, source_code, source_name
+• destination_code, destination_name
+• departure_datetime, arrival_datetime
+• duration_hrs, stopovers, aircraft_type
+• travel_class, booking_source
+• base_fare_bdt, tax_surcharge_bdt, total_fare_bdt
+• seasonality, days_before_departure
+
+Audit columns:
 • is_valid (boolean)
 • validation_errors (text)
-• validated_at (timestamp)
-• loaded_at (timestamp)
+• mysql_raw_id, mysql_validated_id
+• mysql_loaded_at, bronze_loaded_at
 ```
+
+---
 
 ### Silver Layer
 - **Schema**: `silver`
-- **Table**: `silver_cleaned_flights`
-- **Row Count**: 57,000
+- **Purpose**: Cleaned, standardized data with derived columns
 
-**Transformations**:
+**Main Table: silver_cleaned_flights**
+- **Row Count**: 57,000 (valid records only)
+- **Source**: bronze.validated_flights
+
+**Transformations Applied**:
 ```
-• Filter to valid records only
-• Standardize text (UPPER case, trim whitespace)
-• Add derived columns:
-  - route (source || '-' || destination)
-  - fare_category (Budget/Standard/Premium based on total_fare)
-  - booking_window (Last Minute/Standard/Advance/Early Bird)
-  - route_type (Domestic/International)
-  - is_peak_season (boolean based on seasonality)
-• Parse time dimensions (hour, day of week)
+1. Text Standardization
+   • Convert all text to UPPERCASE
+   • Trim leading/trailing whitespace
+   • Replace multiple spaces with single space
+
+2. Derived Columns
+   • route = source_code || '-' || destination_code
+   • fare_category = CASE
+       WHEN total_fare_bdt <= 5000 THEN 'Budget'
+       WHEN total_fare_bdt <= 15000 THEN 'Standard'
+       ELSE 'Premium'
+     END
+   • booking_window = CASE
+       WHEN days_before_departure = 1 THEN 'Last Minute'
+       WHEN days_before_departure <= 7 THEN 'Standard'
+       WHEN days_before_departure <= 30 THEN 'Advance'
+       ELSE 'Early Bird'
+     END
+   • route_type = CASE
+       WHEN source_code IN (select code from domestic_airports) 
+         AND destination_code IN (select code from domestic_airports)
+         THEN 'Domestic'
+       ELSE 'International'
+     END
+   • is_peak_season = seasonality IN ('Eid', 'Hajj', 'Winter Holidays')
+
+3. Time Dimensions
+   • departure_hour = EXTRACT(HOUR FROM departure_datetime)
+   • departure_dow = EXTRACT(DOW FROM departure_datetime)
+   • departure_date = DATE(departure_datetime)
 ```
 
-**SCD Snapshots**:
-```
-silver.flight_fare_snapshot
-├── Tracks: airline, route, class, seasonality combinations
-├── Columns: avg_base_fare, avg_total_fare, booking_count
-├── Records: 19,052
-├── Strategy: check (monitors specific columns)
-└── SCD columns: dbt_valid_from, dbt_valid_to, dbt_scd_id, dbt_updated_at
+**SCD Type 2 Snapshots**:
 
-silver.route_fare_snapshot
-├── Tracks: route-level metrics
-├── Columns: avg_fare, total_bookings, airline_count
-├── Records: 152
-├── Strategy: check
-└── SCD columns: dbt_valid_from, dbt_valid_to, dbt_scd_id, dbt_updated_at
-```
+1. **flight_fare_snapshot** (~19,052 rows)
+   ```
+   Tracks: airline, source_code, destination_code, travel_class, seasonality
+   Metrics aggregated at this grain:
+   • avg_base_fare
+   • avg_total_fare
+   • booking_count
+   • min_fare, max_fare
+   • total_revenue
+   
+   SCD Columns:
+   • dbt_valid_from (when record became current)
+   • dbt_valid_to (when record was superseded)
+   • dbt_scd_id (unique identifier for dimension)
+   • dbt_updated_at (timestamp of latest update)
+   ```
+
+2. **route_fare_snapshot** (~152 rows)
+   ```
+   Tracks: source_code, destination_code
+   Metrics aggregated at this grain:
+   • avg_fare
+   • total_bookings
+   • airline_count
+   • unique_classes
+   
+   SCD Columns:
+   • dbt_valid_from, dbt_valid_to
+   • dbt_scd_id, dbt_updated_at
+   ```
+
+---
 
 ### Gold Layer
 - **Schema**: `gold`
-- **Purpose**: Business-ready KPI tables
+- **Purpose**: Business-ready KPI tables for analytics and reporting
 
-**Tables**:
-
-| Table | Description | Rows |
-|-------|-------------|------|
-| `gold_avg_fare_by_airline` | Fare statistics per airline (avg, min, max, median, market share) | 24 |
-| `gold_seasonal_fare_analysis` | Fare comparison across seasons with percentage difference | 4 |
-| `gold_booking_count_by_airline` | Booking volume by airline, source, and window | 24 |
-| `gold_popular_routes` | Top routes by booking count with fare stats | 152 |
-| `gold_fare_by_class` | Fare analysis by travel class (Economy/Business/First) | 3 |
-| `gold_data_quality_report` | Categorical value distribution tracking | 13 |
-
-**Views**:
+**Table 1: gold_avg_fare_by_airline** (24 rows)
 ```
-gold_fare_history
-├── Joins flight_fare_snapshot with current data
-├── Shows historical fare changes over time
-└── Includes valid_from and valid_to dates
+Dimensions:
+  • airline
 
-gold_route_history
-├── Joins route_fare_snapshot with current data
-├── Shows historical route metric changes
-└── Includes valid_from and valid_to dates
+Metrics:
+  • avg_base_fare
+  • avg_total_fare
+  • min_fare
+  • max_fare
+  • median_fare
+  • booking_count
+  • market_share (%)
+
+Grain: One row per airline
 ```
+
+**Table 2: gold_seasonal_fare_analysis** (4 rows)
+```
+Dimensions:
+  • seasonality (Regular, Eid, Hajj, Winter)
+
+Metrics:
+  • avg_fare
+  • booking_count
+  • pct_diff_from_regular
+  • revenue_share
+
+Grain: One row per season
+```
+
+**Table 3: gold_booking_count_by_airline** (24 rows)
+```
+Dimensions:
+  • airline
+
+Metrics:
+  • total_bookings
+  • total_revenue
+  • avg_booking_value
+  • booking_by_class (JSON)
+  • booking_by_window (JSON)
+
+Grain: One row per airline
+```
+
+**Table 4: gold_popular_routes** (152 rows)
+```
+Dimensions:
+  • source_code, source_name
+  • destination_code, destination_name
+  • airline
+
+Metrics:
+  • booking_count
+  • avg_fare
+  • flight_count
+  • bookings_rank (by route)
+
+Grain: One row per route/airline combo, ordered by popularity
+```
+
+**Table 5: gold_fare_by_class** (3 rows)
+```
+Dimensions:
+  • travel_class (Economy, Business, First)
+
+Metrics:
+  • avg_fare
+  • min_fare
+  • max_fare
+  • booking_count
+  • revenue_share
+
+Grain: One row per class
+```
+
+**Table 6: gold_data_quality_report** (13 rows)
+```
+Metrics tracked:
+  • record_count
+  • valid_record_count
+  • invalid_record_count
+  • null_count_by_column (for nullable fields)
+  • unique_airline_count
+  • unique_route_count
+  • pct_valid_records
+
+Grain: Quality metrics (one row per metric)
+```
+
+**Views (2)**:
+
+1. **gold_fare_history**
+   ```
+   Joins: gold_avg_fare_by_airline + flight_fare_snapshot
+   Shows: Historical fare changes with valid_from/valid_to dates
+   Columns: airline, avg_fare_current, avg_fare_previous, 
+            change_pct, valid_from, valid_to
+   ```
+
+2. **gold_route_history**
+   ```
+   Joins: gold_popular_routes + route_fare_snapshot
+   Shows: Historical route metric changes
+   Columns: route, booking_count_current, booking_count_previous,
+            change_pct, valid_from, valid_to
+   ```
+
+---
 
 ### Audit Schema
 - **Schema**: `audit`
-- **Table**: `pipeline_runs`
+- **Purpose**: Pipeline monitoring and troubleshooting
 
-**Columns**:
+**Table: pipeline_runs**
 ```
-• id (serial)
-• run_id (uuid)
-• dag_id (varchar)
-• task_id (varchar)
-• status (varchar: started/completed/failed)
-• rows_processed (integer)
-• rows_failed (integer)
-• started_at (timestamp)
-• completed_at (timestamp)
-• error_message (text)
-• metadata (jsonb)
+Columns:
+  • id (serial primary key)
+  • run_id (UUID - unique per DAG run)
+  • dag_id (varchar - 'flight_price_pipeline')
+  • task_id (varchar - task name)
+  • status (varchar - 'started', 'completed', 'failed')
+  • rows_processed (integer)
+  • rows_failed (integer)
+  • rows_with_warnings (integer)
+  • started_at (timestamp)
+  • completed_at (timestamp)
+  • error_message (text, nullable)
+  • metadata (JSONB - flexible attributes)
+
+Metadata JSON fields:
+  {
+    "source_file": "...",
+    "rows_with_null_values": 0,
+    "validation_rate": "100%",
+    "unexpected_values": {...},
+    "dbt_results": {...}
+  }
 ```
 
 ---

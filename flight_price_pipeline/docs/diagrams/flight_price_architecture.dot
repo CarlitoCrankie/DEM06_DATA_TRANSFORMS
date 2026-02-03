@@ -1,10 +1,10 @@
-digraph "Flight Price Analysis Pipeline Architecture" {
+digraph "Flight Price Analysis Pipeline Architecture (5 Tasks)" {
     graph [
         rankdir=LR,
         bgcolor=white,
         fontname=Helvetica,
         fontsize=12,
-        label="Flight Price Analysis Pipeline Architecture",
+        label="Flight Price Analysis Pipeline Architecture - With Kaggle Extraction (5 Tasks)",
         margin="0.5,0.5",
         nodesep=1.0,
         ranksep=1.5,
@@ -23,19 +23,20 @@ digraph "Flight Price Analysis Pipeline Architecture" {
         penwidth=2
         margin=20
         
-        // Data Source Layer
-        subgraph cluster_datasource {
-            label="Data Source Layer"
+        // Data Source Layer - Kaggle
+        subgraph cluster_kaggle {
+            label="Data Source Layer - Kaggle"
             style=rounded
             bgcolor="#E3F2FD"
             margin=15
             
-            CSV [label="CSV Source\nFlight_Price_Dataset.csv\n\n57,000 records\n18 columns", shape=folder]
+            Kaggle [label="Kaggle Dataset\nmahatiratusher/\nflight-price-dataset-of-bangladesh", shape=folder]
+            CSV [label="CSV File\nFlight_Price_Dataset.csv\n\n57,000 records\n18 columns", shape=folder]
         }
         
         // Airflow Orchestration Layer
         subgraph cluster_airflow {
-            label="Airflow Orchestration Layer"
+            label="Airflow Orchestration Layer (5 Tasks)"
             style=rounded
             bgcolor="#FFE0B2"
             margin=15
@@ -43,11 +44,13 @@ digraph "Flight Price Analysis Pipeline Architecture" {
             WebServer [label="Airflow Webserver\n:8080"]
             Scheduler [label="Airflow Scheduler"]
             
-            Task1 [label="Task 1: Load CSV\n~8 seconds\n57,000 rows", shape=box]
-            Task2 [label="Task 2: Validate Data\n~10 seconds\n100% pass rate", shape=box]
-            Task3 [label="Task 3: Transfer to PostgreSQL\n~12 seconds\n57,000 rows", shape=box]
-            Task4 [label="Task 4: DBT Run + Snapshot\n~4 seconds\n9 models", shape=box]
+            Task0 [label="Task 0: Extract from Kaggle\n~15 seconds\nDownload + Schema Check\nCredential Priority: .env > Airflow Vars > kaggle.json", shape=box, style="filled,rounded", fillcolor="#FFB3BA"]
+            Task1 [label="Task 1: Load CSV to MySQL\n~8 seconds\n57,000 rows\nRename columns, convert types", shape=box]
+            Task2 [label="Task 2: Validate Data\n~10 seconds\n100% pass rate\nHard & soft validation rules", shape=box]
+            Task3 [label="Task 3: Transfer to PostgreSQL\n~12 seconds\n57,000 rows\nExtract valid + type conversion", shape=box]
+            Task4 [label="Task 4: DBT Run + Snapshot\n~4 seconds\n9 models, 22 tests\nSilver + Gold layers", shape=box]
             
+            Task0 -> Task1 [label="Task dependency", color="#1976D2", style=solid, penwidth=2]
             Task1 -> Task2 [label="Task dependency", color="#1976D2", style=solid, penwidth=2]
             Task2 -> Task3 [label="Task dependency", color="#1976D2", style=solid, penwidth=2]
             Task3 -> Task4 [label="Task dependency", color="#1976D2", style=solid, penwidth=2]
@@ -126,10 +129,12 @@ digraph "Flight Price Analysis Pipeline Architecture" {
         }
         
         // Data Flow Connections
-        CSV -> Task1 [label="Task 1: Read CSV\nwith Pandas", color="#1976D2", style=solid, penwidth=2]
-        Task1 -> RawTable [label="Insert\n57,000 rows", color="#1976D2", style=solid, penwidth=2]
-        ValTable -> Task3 [label="Task 3: Extract\nvalid records only", color="#388E3C", style=solid, penwidth=2]
-        Task3 -> Bronze [label="Transfer via JDBC\nBoolean conversion", color="#388E3C", style=solid, penwidth=2]
+        Kaggle -> Task0 [label="Task 0: Download\nwith retry (3x)\nFallback to local copy", color="#FF6B6B", style=solid, penwidth=2.5]
+        Task0 -> CSV [label="Extract ZIP\nValidate schema\nTrack metadata", color="#FF6B6B", style=solid, penwidth=2.5]
+        CSV -> Task1 [label="Task 1: Read CSV\nwith Pandas\nColumn mapping", color="#1976D2", style=solid, penwidth=2]
+        Task1 -> RawTable [label="Insert\n57,000 rows\nIn batches (5000)", color="#1976D2", style=solid, penwidth=2]
+        ValTable -> Task3 [label="Task 3: Extract\nvalid records only\nJoin + Filter WHERE is_valid=1", color="#388E3C", style=solid, penwidth=2]
+        Task3 -> Bronze [label="Transfer via SQLAlchemy\nBoolean conversion\nAdd audit columns", color="#388E3C", style=solid, penwidth=2]
         Task4 -> Bronze [label="Task 4: DBT Source", color="#F57C00", style=solid]
         Task4 -> Silver [label="Task 4: DBT Run", color="#F57C00", style=solid]
     }

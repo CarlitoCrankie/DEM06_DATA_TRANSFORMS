@@ -7,6 +7,7 @@ RUN apt-get update && apt-get install -y \
     gcc \
     default-libmysqlclient-dev \
     pkg-config \
+    unzip \
     && rm -rf /var/lib/apt/lists/*
 
 USER airflow
@@ -19,4 +20,6 @@ RUN pip install --no-cache-dir \
     sqlalchemy==1.4.50 \
     mysqlclient==2.2.0 \
     psycopg2-binary==2.9.9 \
-    dbt-postgres==1.7.4
+    dbt-postgres==1.7.4 \
+    pymysql==1.1.0 \
+    kaggle==1.6.14
