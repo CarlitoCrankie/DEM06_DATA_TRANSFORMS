@@ -9,9 +9,9 @@ An end-to-end data pipeline that processes and analyzes flight price data for Ba
 
 ## Architecture
 
-```
+
 ![System Architecture](System_architecture.png)
-```
+
 
 ---
 
@@ -24,11 +24,27 @@ An end-to-end data pipeline that processes and analyzes flight price data for Ba
 | Analytics Database | PostgreSQL 15 | Data warehouse with medallion architecture |
 | Transformation | DBT 1.7.4 | SQL-based transformations and testing |
 | Data Processing | Python 3.10, Pandas | Data ingestion and validation |
+| Data Extraction | Kaggle API | Automated dataset download |
 | Infrastructure | Docker Compose | Containerized deployment |
 
 ---
 
 ## Data Pipeline Flow
+
+### 0. Kaggle Data Extraction
+- **Input**: Kaggle API (dataset: `mahatiratusher/flight-price-dataset-of-bangladesh`)
+- **Process**: 
+  - Download dataset using Kaggle API
+  - Compare schema with previous version
+  - Detect new columns
+  - ALTER MySQL tables if schema changed
+  - Record metadata (row count, columns, schema hash)
+- **Output**: CSV file + metadata record in `dataset_metadata` table
+- **Duration**: ~5-10 seconds
+- **Features**:
+  - 3 retries with exponential backoff
+  - Falls back to existing file if download fails
+  - Credentials from `.env` file
 
 ### 1. Data Ingestion
 - **Input**: `Flight_Price_Dataset_of_Bangladesh.csv` (57,000 records, 18 columns)
@@ -114,6 +130,46 @@ An end-to-end data pipeline that processes and analyzes flight price data for Ba
 
 ---
 
+## Schema Evolution
+
+### Automatic Column Detection
+
+The pipeline automatically detects and handles new columns in the source dataset:
+
+**Process:**
+1. Download latest dataset from Kaggle
+2. Compare CSV columns with existing MySQL table columns
+3. If new columns detected:
+   - `ALTER TABLE` to add new columns (NULL allowed)
+   - Update both `raw_flight_data` and `validated_flight_data`
+   - Log change in `dataset_metadata` table
+4. Continue pipeline with expanded schema
+
+**Metadata Tracking:**
+- **Table**: `dataset_metadata`
+- **Tracks**: 
+  - Row count, column count, file size
+  - Full column list with data types (JSON)
+  - Schema hash for quick comparison
+  - New columns added (JSON array)
+  - Link to previous version
+
+**Example:**
+```sql
+SELECT 
+    id,
+    download_timestamp,
+    row_count,
+    column_count,
+    schema_changed,
+    new_columns_added
+FROM dataset_metadata
+ORDER BY id DESC
+LIMIT 5;
+```
+---
+
+
 ## Key Performance Indicators
 
 ### 1. Average Fare by Airline
@@ -166,26 +222,34 @@ An end-to-end data pipeline that processes and analyzes flight price data for Ba
 
 ## Project Structure
 
-```
+``
 flight_price_pipeline/
 │
-├── docker-compose.yml              # Container orchestration
-├── Dockerfile.airflow              # Custom Airflow image
-├── .env                            # Environment variables
+├── .env                              # Environment variables (Kaggle credentials)
+├── .gitignore                        # Git ignore rules
+├── docker-compose.yml                # Container orchestration
+├── Dockerfile.airflow                # Custom Airflow image
+├── README.md                         # Project documentation
 │
 ├── dags/
-│   ├── flight_pipeline_dag.py      # Main Airflow DAG
+│   ├── flight_pipeline_dag.py        # Main Airflow DAG (5 tasks)
 │   └── utils/
-│       └── logging_utils.py        # Custom logging functions
+│       └── logging_utils.py          # Custom logging functions
+│
+├── data/
+│   └── Flight_Price_Dataset_of_Bangladesh.csv   # Downloaded from Kaggle
 │
 ├── dbt_project/
-│   ├── dbt_project.yml             # DBT configuration
-│   ├── profiles.yml                # Database connections
+│   ├── dbt_project.yml               # DBT project configuration
+│   ├── profiles.yml                  # DBT database connection profiles
+│   │
 │   ├── models/
-│   │   ├── sources.yml             # Source definitions
+│   │   ├── sources.yml               # Raw source definitions
+│   │   │
 │   │   ├── silver/
 │   │   │   ├── silver_cleaned_flights.sql
 │   │   │   └── schema.yml
+│   │   │
 │   │   └── gold/
 │   │       ├── gold_avg_fare_by_airline.sql
 │   │       ├── gold_seasonal_fare_analysis.sql
@@ -196,23 +260,33 @@ flight_price_pipeline/
 │   │       ├── gold_fare_history.sql
 │   │       ├── gold_route_history.sql
 │   │       └── schema.yml
+│   │
 │   ├── snapshots/
 │   │   ├── flight_fare_snapshot.sql
 │   │   └── route_fare_snapshot.sql
+│   │
 │   └── macros/
-│       └── get_custom_schema.sql   # Custom schema naming
+│       └── get_custom_schema.sql     # Custom schema naming
 │
-├── data/
-│   └── Flight_Price_Dataset_of_Bangladesh.csv
+├── docs/
+│   ├── agent.md                      # Diagram generation agent instructions
+│   ├── instructions.md               # Detailed architecture specification
+│   ├── generate_architecture.py      # Diagram generation script
+│   ├── requirements.txt              # Python dependencies for diagrams
+│   └── diagrams/
+│       ├── flight_price_architecture.drawio
+│       ├── flight_price_architecture.png
+│       ├── System_architecture.png   # Main architecture diagram
+│       └── viewer.html               # Diagram viewer
 │
-├── scripts/
-│   ├── init_mysql.sql              # MySQL initialization
-│   └── init_postgres.sql           # PostgreSQL initialization
+├── logs/                             # Airflow logs
+├── plugins/                          # Airflow plugins
 │
-└── logs/                           # Airflow logs
-```
+└── scripts/
+    ├── init_mysql.sql                # MySQL initialization (includes dataset_metadata)
+    └── init_postgres.sql             # PostgreSQL initialization
 
----
+``
 
 ## Setup Instructions
 
@@ -220,6 +294,7 @@ flight_price_pipeline/
 - Docker and Docker Compose installed
 - 8GB RAM minimum
 - Ports available: 8080 (Airflow), 3307 (MySQL), 5433 (PostgreSQL)
+- Kaggle account and API credentials
 
 ### Installation
 
@@ -228,9 +303,32 @@ flight_price_pipeline/
 cd flight_price_pipeline
 ```
 
-2. **Download dataset**
-- Source: [Kaggle - Flight Price Dataset of Bangladesh](https://www.kaggle.com/datasets/mahatiratusher/flight-price-dataset-of-bangladesh)
-- Place in `data/Flight_Price_Dataset_of_Bangladesh.csv`
+2. **Create .env file with Kaggle credentials**
+cat > .env << EOF
+# Airflow
+AIRFLOW_SECRET_KEY=$(python3 -c "import secrets; print(secrets.token_hex(32))")
+
+# MySQL Staging
+MYSQL_ROOT_PASSWORD=rootpassword
+MYSQL_DATABASE=flight_staging
+MYSQL_USER=flight_user
+MYSQL_PASSWORD=flight_pass
+
+# PostgreSQL Analytics
+POSTGRES_ANALYTICS_USER=analytics_user
+POSTGRES_ANALYTICS_PASSWORD=analytics_pass
+POSTGRES_ANALYTICS_DB=flight_analytics
+
+# PostgreSQL Airflow
+POSTGRES_AIRFLOW_USER=airflow
+POSTGRES_AIRFLOW_PASSWORD=airflow
+POSTGRES_AIRFLOW_DB=airflow
+
+# Kaggle Credentials (Get from https://www.kaggle.com/settings/account)
+KAGGLE_USERNAME=your_kaggle_username
+KAGGLE_KEY=your_kaggle_api_key
+EOF
+
 
 3. **Start services**
 ```bash
@@ -335,7 +433,7 @@ FROM silver.flight_fare_snapshot;
 
 | Metric | Value |
 |--------|-------|
-| Total Pipeline Duration | ~34 seconds |
+| Total Pipeline Duration | ~40-45 seconds |
 | Source Records | 57,000 |
 | Valid Records | 57,000 (100%) |
 | Airlines | 24 |
@@ -343,7 +441,14 @@ FROM silver.flight_fare_snapshot;
 | DBT Models | 9 |
 | DBT Tests | 22 (all passing) |
 | SCD Snapshots | 2 |
+| Metadata Records | 1 per run |
 
+**Task Breakdown:**
+- Task 0 (Kaggle Extract): ~5-10 seconds
+- Task 1 (Load CSV): ~8 seconds
+- Task 2 (Validate): ~10 seconds
+- Task 3 (Transfer): ~12 seconds
+- Task 4 (DBT): ~4 seconds
 ---
 
 ## Challenges and Solutions
@@ -390,6 +495,20 @@ df['is_valid'] = df['is_valid'].astype(bool)
         {{ custom_schema_name | trim }}
     {%- endif -%}
 {%- endmacro %}
+```
+### Challenge 5: Schema Evolution
+**Issue**: Source dataset may add new columns over time, breaking the pipeline.
+
+**Solution**: Implemented automatic schema detection and evolution:
+```python
+# Compare CSV columns with MySQL table columns
+existing_columns = get_mysql_table_columns('raw_flight_data')
+new_columns = [col for col in csv_columns if col not in existing_columns]
+
+if new_columns:
+    for new_col in new_columns:
+        mysql_type = infer_mysql_type(df[new_col].dtype, df[new_col])
+        cursor.execute(f"ALTER TABLE raw_flight_data ADD COLUMN `{new_col}` {mysql_type} NULL")
 ```
 
 ---
