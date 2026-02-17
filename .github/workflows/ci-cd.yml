@@ -96,9 +96,14 @@ jobs:
         with:
           python-version: '3.10'
       
-      - name: Install DBT
+      - name: Install DBT with compatible dependencies
         run: |
+          pip install protobuf==4.25.3
           pip install dbt-postgres==1.7.4
+      
+      - name: Verify DBT installation
+        run: |
+          dbt --version
       
       - name: Create mock DBT profile
         run: |
@@ -122,7 +127,7 @@ jobs:
         working-directory: ./flight_price_pipeline/dbt_project
         run: |
           dbt parse --no-version-check
-  
+
   docker-build:
     name: Build Docker Images
     runs-on: ubuntu-latest
