@@ -38,28 +38,33 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install flake8 pytest pytest-cov
-          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+          if [ -f flight_price_pipeline/requirements.txt ]; then 
+            pip install -r flight_price_pipeline/requirements.txt
+          fi
       
       - name: Lint with flake8
+        working-directory: ./flight_price_pipeline
         run: |
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
       
       - name: Run unit tests with coverage
+        working-directory: ./flight_price_pipeline
         run: |
           python -m pytest tests/unit/ -v --cov=dags/utils --cov-report=xml --cov-report=term-missing
         continue-on-error: true
       
       - name: Upload coverage reports
-        if: always() && hashFiles('coverage.xml') != ''
+        if: always() && hashFiles('flight_price_pipeline/coverage.xml') != ''
         uses: codecov/codecov-action@v3
         with:
-          file: ./coverage.xml
+          file: ./flight_price_pipeline/coverage.xml
           flags: unittests
           name: codecov-umbrella
           fail_ci_if_error: false
       
       - name: Run integration tests
+        working-directory: ./flight_price_pipeline
         run: |
           if [ -d "tests/integration" ]; then
             python -m pytest tests/integration/ -v
@@ -74,10 +79,10 @@ jobs:
         with:
           name: test-results-${{ matrix.python-version }}
           path: |
-            coverage.xml
-            .coverage
+            flight_price_pipeline/coverage.xml
+            flight_price_pipeline/.coverage
           if-no-files-found: ignore
-
+  
   validate-dbt:
     name: Validate DBT Models
     runs-on: ubuntu-latest
@@ -114,7 +119,7 @@ jobs:
           EOF
       
       - name: DBT Parse (Validate SQL)
-        working-directory: ./dbt_project
+        working-directory: ./flight_price_pipeline/dbt_project
         run: |
           dbt parse --no-version-check
   
@@ -131,16 +136,21 @@ jobs:
         uses: docker/setup-buildx-action@v3
       
       - name: Validate docker-compose.yml
+        working-directory: ./flight_price_pipeline
         run: |
-          docker-compose config
+          docker compose config
       
       - name: Build Docker images (dry run)
+        working-directory: ./flight_price_pipeline
         run: |
-          docker-compose build --no-cache || echo "Docker build test completed"
+          docker compose build --no-cache || echo "Docker build test completed"
   
   security-scan:
     name: Security Scanning
     runs-on: ubuntu-latest
+    permissions:
+      security-events: write
+      contents: read
     
     steps:
       - name: Checkout code
@@ -150,14 +160,15 @@ jobs:
         uses: aquasecurity/trivy-action@master
         with:
           scan-type: 'fs'
-          scan-ref: '.'
+          scan-ref: './flight_price_pipeline'
           format: 'sarif'
           output: 'trivy-results.sarif'
       
       - name: Upload Trivy results
-        uses: github/codeql-action/upload-sarif@v2
+        uses: github/codeql-action/upload-sarif@v3
         with:
           sarif_file: 'trivy-results.sarif'
+        continue-on-error: true
   
   build-status:
     name: Build Status Summary
