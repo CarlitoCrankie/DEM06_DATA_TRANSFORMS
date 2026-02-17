@@ -13,6 +13,7 @@ jobs:
     runs-on: ubuntu-latest
     
     strategy:
+      fail-fast: false
       matrix:
         python-version: ['3.10', '3.11']
     
@@ -41,9 +42,7 @@ jobs:
       
       - name: Lint with flake8
         run: |
-          # Stop build if Python syntax errors or undefined names
           flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
-          # Exit-zero treats all errors as warnings
           flake8 . --count --exit-zero --max-complexity=10 --max-line-length=100 --statistics
       
       - name: Run unit tests with coverage
@@ -64,7 +63,7 @@ jobs:
       
       - name: Archive test results
         if: always()
-        uses: actions/upload-artifact@v3
+        uses: actions/upload-artifact@v4
         with:
           name: test-results-${{ matrix.python-version }}
           path: |
@@ -88,15 +87,28 @@ jobs:
         run: |
           pip install dbt-postgres==1.7.4
       
-      - name: DBT Debug
-        working-directory: ./dbt_project
+      - name: Create mock DBT profile
         run: |
-          dbt debug || echo "DBT debug completed with warnings"
+          mkdir -p ~/.dbt
+          cat > ~/.dbt/profiles.yml << EOF
+          flight_analytics:
+            target: ci
+            outputs:
+              ci:
+                type: postgres
+                host: localhost
+                user: ci_user
+                password: ci_pass
+                port: 5432
+                dbname: ci_db
+                schema: bronze
+                threads: 1
+          EOF
       
       - name: DBT Parse (Validate SQL)
         working-directory: ./dbt_project
         run: |
-          dbt parse || echo "DBT parse completed"
+          dbt parse --no-version-check
   
   docker-build:
     name: Build Docker Images
