@@ -56,7 +56,7 @@ default_args = {
     'start_date': datetime(2024, 1, 1),
     'email_on_failure': True,
     'email_on_retry': False,
-    'email': ['your-email@example.com'],  # ⚠️ UPDATE THIS WITH YOUR EMAIL
+    'email': Variable.get("SMTP_EMAIL"), 
     'retries': 2,
     'retry_delay': timedelta(minutes=5),
     'execution_timeout': timedelta(minutes=30),
