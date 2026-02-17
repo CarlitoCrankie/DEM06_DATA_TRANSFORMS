@@ -10,6 +10,14 @@ x-airflow-common: &airflow-common
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__SCHEDULER__MIN_FILE_PROCESS_INTERVAL: 30
     AIRFLOW__WEBSERVER__SECRET_KEY: ${AIRFLOW_SECRET_KEY}
+    # EMAIL CONFIGURATION (ADD THESE)
+    AIRFLOW__SMTP__SMTP_HOST: smtp.gmail.com
+    AIRFLOW__SMTP__SMTP_STARTTLS: 'true'
+    AIRFLOW__SMTP__SMTP_SSL: 'false'
+    AIRFLOW__SMTP__SMTP_USER: carlcrankson966@gmail.com
+    AIRFLOW__SMTP__SMTP_PASSWORD: vqyw ihsh jhae ppnr
+    AIRFLOW__SMTP__SMTP_PORT: 587
+    AIRFLOW__SMTP__SMTP_MAIL_FROM: carlcrankson966@gmail.com
     # MySQL connection info
     MYSQL_HOST: mysql
     MYSQL_PORT: 3306

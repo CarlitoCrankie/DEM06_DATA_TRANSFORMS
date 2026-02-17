@@ -1,0 +1,753 @@
+# incremental_load_implementation_guide.txt
+
+================================================================================
+INCREMENTAL LOAD IMPLEMENTATION GUIDE
+For DEM06_DATA_TRANSFORMS Flight Price Pipeline
+================================================================================
+
+PROJECT: flight_price_pipeline (Your existing Airflow data pipeline)
+PURPOSE: Add incremental loading capability to reduce resource usage
+ESTIMATED TIME: 2-3 hours
+DIFFICULTY: Intermediate
+
+================================================================================
+OVERVIEW
+================================================================================
+
+Current State:
+- Full TRUNCATE and reload on every run (57,000 records each time)
+- No change tracking
+- High resource usage
+
+Target State:
+- Incremental loading (only new/changed records)
+- Change detection with MD5 hashing
+- Load metadata tracking
+- Smart decision: Full vs Incremental based on change percentage
+
+================================================================================
+FILES TO MODIFY/CREATE
+================================================================================
+
+EXISTING PROJECT STRUCTURE:
+flight_price_pipeline/
+├── dags/
+│   ├── flight_pipeline_dag.py          [MODIFY]
+│   └── utils/
+│       ├── logging_utils.py            [EXISTS]
+│       └── incremental_loader.py       [CREATE NEW]
+├── scripts/
+│   ├── init_postgres.sql               [MODIFY]
+│   └── init_mysql.sql                  [NO CHANGE]
+└── dbt_project/                        [NO CHANGE]
+
+================================================================================
+STEP 1: UPDATE POSTGRESQL SCHEMA
+================================================================================
+
+FILE: scripts/init_postgres.sql
+ACTION: Add tracking columns and metadata table
+
+--- ADD AFTER EXISTING bronze.validated_flights TABLE ---
+
+-- Step 1.1: Add tracking columns to existing table
+ALTER TABLE bronze.validated_flights 
+ADD COLUMN IF NOT EXISTS record_hash VARCHAR(64),
+ADD COLUMN IF NOT EXISTS data_source_id INTEGER,
+ADD COLUMN IF NOT EXISTS ingestion_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+ADD COLUMN IF NOT EXISTS is_active BOOLEAN DEFAULT TRUE;
+
+-- Step 1.2: Create indexes for performance
+CREATE INDEX IF NOT EXISTS idx_record_hash 
+ON bronze.validated_flights(record_hash);
+
+CREATE INDEX IF NOT EXISTS idx_ingestion_timestamp 
+ON bronze.validated_flights(ingestion_timestamp);
+
+CREATE INDEX IF NOT EXISTS idx_is_active 
+ON bronze.validated_flights(is_active);
+
+-- Step 1.3: Create metadata tracking table
+CREATE TABLE IF NOT EXISTS bronze.data_load_metadata (
+    load_id SERIAL PRIMARY KEY,
+    load_timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    source_file VARCHAR(255),
+    records_inserted INTEGER DEFAULT 0,
+    records_updated INTEGER DEFAULT 0,
+    records_deleted INTEGER DEFAULT 0,
+    records_unchanged INTEGER DEFAULT 0,
+    load_type VARCHAR(20),  -- 'FULL' or 'INCREMENTAL'
+    kaggle_dataset_version VARCHAR(50),
+    schema_hash VARCHAR(64),
+    change_percentage DECIMAL(5,2),
+    execution_time_seconds INTEGER
+);
+
+-- Step 1.4: Create index on metadata table
+CREATE INDEX IF NOT EXISTS idx_load_timestamp 
+ON bronze.data_load_metadata(load_timestamp);
+
+NOTES:
+- Run this after backing up your database
+- These are ALTER TABLE commands, so existing data is preserved
+- Existing records will have NULL for new columns initially
+
+================================================================================
+STEP 2: CREATE INCREMENTAL LOADER UTILITY
+================================================================================
+
+FILE: dags/utils/incremental_loader.py
+ACTION: Create new file with the following content
+
+--- COPY THIS ENTIRE FILE ---
+
+"""
+Incremental Data Loader for Flight Price Pipeline
+Handles change detection and incremental loading to PostgreSQL
+"""
+
+import pandas as pd
+import hashlib
+from datetime import datetime
+from airflow.providers.postgres.hooks.postgres import PostgresHook
+from airflow.providers.mysql.hooks.mysql import MySqlHook
+
+class IncrementalDataLoader:
+    """
+    Handles incremental data loading with change detection
+    """
+    
+    def __init__(self, postgres_conn_id='postgres_analytics', mysql_conn_id='mysql_staging'):
+        self.postgres_hook = PostgresHook(postgres_conn_id=postgres_conn_id)
+        self.mysql_hook = MySqlHook(mysql_conn_id=mysql_conn_id)
+        self.load_stats = {
+            'new': 0,
+            'updated': 0,
+            'deleted': 0,
+            'unchanged': 0
+        }
+        
+    def calculate_record_hash(self, row):
+        """
+        Calculate MD5 hash of record for change detection
+        Uses key fields that define record uniqueness
+        """
+        key_fields = [
+            str(row.get('airline', '')),
+            str(row.get('source', '')),
+            str(row.get('destination', '')),
+            str(row.get('date', '')),
+            str(row.get('departure_time', '')),
+            str(row.get('base_fare', '')),
+            str(row.get('total_fare', ''))
+        ]
+        
+        record_string = '|'.join(key_fields)
+        return hashlib.md5(record_string.encode()).hexdigest()
+    
+    def load_new_data_from_mysql(self):
+        """Load validated data from MySQL staging"""
+        query = "SELECT * FROM validated_flight_data WHERE is_valid = 1"
+        df = self.mysql_hook.get_pandas_df(query)
+        print(f"📥 Loaded {len(df):,} records from MySQL staging")
+        return df
+    
+    def load_existing_data_from_postgres(self):
+        """Load current active data from PostgreSQL Bronze layer"""
+        query = """
+        SELECT 
+            airline, source, destination, date, departure_time,
+            base_fare, total_fare, record_hash
+        FROM bronze.validated_flights
+        WHERE is_active = TRUE
+        """
+        
+        try:
+            df = self.postgres_hook.get_pandas_df(query)
+            print(f"📊 Loaded {len(df):,} existing records from PostgreSQL")
+            return df
+        except Exception as e:
+            print(f"⚠️ No existing data or error: {e}")
+            return pd.DataFrame()
+    
+    def detect_changes(self, new_df):
+        """
+        Detect new, updated, and deleted records
+        
+        Returns:
+            dict: {
+                'new_records': DataFrame,
+                'deleted_records': DataFrame,
+                'unchanged_records': DataFrame,
+                'change_percentage': float
+            }
+        """
+        print("🔍 Detecting changes in dataset...")
+        start_time = datetime.now()
+        
+        # Calculate hashes for new data
+        new_df['record_hash'] = new_df.apply(self.calculate_record_hash, axis=1)
+        
+        # Get existing data
+        existing_df = self.load_existing_data_from_postgres()
+        
+        if existing_df.empty:
+            print("📊 No existing data. All records are new.")
+            return {
+                'new_records': new_df,
+                'deleted_records': pd.DataFrame(),
+                'unchanged_records': pd.DataFrame(),
+                'change_percentage': 100.0
+            }
+        
+        # Detect changes using hash comparison
+        existing_hashes = set(existing_df['record_hash'])
+        new_hashes = set(new_df['record_hash'])
+        
+        # New records: in new data but not in existing
+        new_record_hashes = new_hashes - existing_hashes
+        new_records = new_df[new_df['record_hash'].isin(new_record_hashes)]
+        
+        # Deleted records: in existing but not in new data
+        deleted_record_hashes = existing_hashes - new_hashes
+        deleted_records = existing_df[existing_df['record_hash'].isin(deleted_record_hashes)]
+        
+        # Unchanged records
+        unchanged_hashes = existing_hashes & new_hashes
+        unchanged_records = new_df[new_df['record_hash'].isin(unchanged_hashes)]
+        
+        # Calculate change percentage
+        total_changes = len(new_records) + len(deleted_records)
+        change_percentage = (total_changes / len(new_df)) * 100 if len(new_df) > 0 else 0
+        
+        # Update stats
+        self.load_stats['new'] = len(new_records)
+        self.load_stats['deleted'] = len(deleted_records)
+        self.load_stats['unchanged'] = len(unchanged_records)
+        
+        detection_time = (datetime.now() - start_time).total_seconds()
+        
+        print(f"📊 Change Detection Summary:")
+        print(f"   New records: {len(new_records):,}")
+        print(f"   Deleted records: {len(deleted_records):,}")
+        print(f"   Unchanged records: {len(unchanged_records):,}")
+        print(f"   Change percentage: {change_percentage:.2f}%")
+        print(f"   Detection time: {detection_time:.2f}s")
+        
+        return {
+            'new_records': new_records,
+            'deleted_records': deleted_records,
+            'unchanged_records': unchanged_records,
+            'change_percentage': change_percentage
+        }
+    
+    def apply_incremental_load(self, changes, load_type='INCREMENTAL'):
+        """
+        Apply incremental changes to Bronze layer
+        
+        Args:
+            changes (dict): Output from detect_changes()
+            load_type (str): 'INCREMENTAL' or 'FULL'
+        """
+        print(f"🔄 Applying {load_type} load...")
+        start_time = datetime.now()
+        
+        conn = self.postgres_hook.get_conn()
+        cursor = conn.cursor()
+        
+        try:
+            # Start transaction
+            cursor.execute("BEGIN")
+            
+            # Insert new records
+            if not changes['new_records'].empty:
+                print(f"➕ Inserting {len(changes['new_records']):,} new records...")
+                
+                # Add ingestion timestamp
+                changes['new_records']['ingestion_timestamp'] = datetime.now()
+                changes['new_records']['is_active'] = True
+                
+                # Insert to PostgreSQL
+                changes['new_records'].to_sql(
+                    'validated_flights',
+                    self.postgres_hook.get_sqlalchemy_engine(),
+                    schema='bronze',
+                    if_exists='append',
+                    index=False,
+                    method='multi',
+                    chunksize=1000
+                )
+            
+            # Soft delete removed records
+            if not changes['deleted_records'].empty:
+                print(f"🗑️ Marking {len(changes['deleted_records']):,} records as inactive...")
+                deleted_hashes = changes['deleted_records']['record_hash'].tolist()
+                
+                # Build parameterized query
+                placeholders = ','.join(['%s'] * len(deleted_hashes))
+                update_query = f"""
+                    UPDATE bronze.validated_flights
+                    SET is_active = FALSE
+                    WHERE record_hash IN ({placeholders})
+                """
+                
+                cursor.execute(update_query, deleted_hashes)
+            
+            # Log metadata
+            execution_time = int((datetime.now() - start_time).total_seconds())
+            
+            cursor.execute("""
+                INSERT INTO bronze.data_load_metadata 
+                (records_inserted, records_updated, records_deleted, records_unchanged,
+                 load_type, change_percentage, execution_time_seconds)
+                VALUES (%s, %s, %s, %s, %s, %s, %s)
+            """, (
+                self.load_stats['new'],
+                self.load_stats['updated'],
+                self.load_stats['deleted'],
+                self.load_stats['unchanged'],
+                load_type,
+                changes['change_percentage'],
+                execution_time
+            ))
+            
+            # Commit transaction
+            conn.commit()
+            print(f"✅ {load_type} load completed successfully in {execution_time}s")
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ {load_type} load failed: {e}")
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def apply_full_load(self, df):
+        """
+        Perform full truncate and reload
+        
+        Args:
+            df (pd.DataFrame): Complete dataset to load
+        """
+        print("🔄 Applying FULL load (truncate and reload)...")
+        start_time = datetime.now()
+        
+        conn = self.postgres_hook.get_conn()
+        cursor = conn.cursor()
+        
+        try:
+            # Start transaction
+            cursor.execute("BEGIN")
+            
+            # Truncate table
+            print("🗑️ Truncating bronze.validated_flights...")
+            cursor.execute("TRUNCATE TABLE bronze.validated_flights")
+            
+            # Add tracking columns
+            df['record_hash'] = df.apply(self.calculate_record_hash, axis=1)
+            df['ingestion_timestamp'] = datetime.now()
+            df['is_active'] = True
+            
+            # Insert all data
+            print(f"➕ Inserting {len(df):,} records...")
+            df.to_sql(
+                'validated_flights',
+                self.postgres_hook.get_sqlalchemy_engine(),
+                schema='bronze',
+                if_exists='append',
+                index=False,
+                method='multi',
+                chunksize=1000
+            )
+            
+            # Log metadata
+            execution_time = int((datetime.now() - start_time).total_seconds())
+            
+            cursor.execute("""
+                INSERT INTO bronze.data_load_metadata 
+                (records_inserted, load_type, change_percentage, execution_time_seconds)
+                VALUES (%s, %s, %s, %s)
+            """, (len(df), 'FULL', 100.0, execution_time))
+            
+            # Commit transaction
+            conn.commit()
+            print(f"✅ FULL load completed successfully in {execution_time}s")
+            
+        except Exception as e:
+            conn.rollback()
+            print(f"❌ FULL load failed: {e}")
+            raise
+        finally:
+            cursor.close()
+            conn.close()
+    
+    def get_load_statistics(self, days=30):
+        """Get load statistics for monitoring"""
+        query = f"""
+        SELECT 
+            load_timestamp,
+            load_type,
+            records_inserted,
+            records_deleted,
+            records_unchanged,
+            change_percentage,
+            execution_time_seconds
+        FROM bronze.data_load_metadata
+        WHERE load_timestamp >= NOW() - INTERVAL '{days} days'
+        ORDER BY load_timestamp DESC
+        LIMIT 10
+        """
+        
+        return self.postgres_hook.get_pandas_df(query)
+
+--- END OF FILE ---
+
+================================================================================
+STEP 3: UPDATE AIRFLOW DAG
+================================================================================
+
+FILE: dags/flight_pipeline_dag.py
+ACTION: Replace the transfer_to_postgres task
+
+--- FIND THIS FUNCTION (around line 150) ---
+
+def transfer_to_postgres(**context):
+    """Transfer validated data from MySQL to PostgreSQL"""
+    # ... existing code ...
+
+--- REPLACE WITH ---
+
+def transfer_to_postgres_incremental(**context):
+    """
+    Transfer validated data from MySQL to PostgreSQL using incremental loading
+    Decides between FULL and INCREMENTAL load based on change percentage
+    """
+    from utils.incremental_loader import IncrementalDataLoader
+    
+    print("🚀 Starting incremental data transfer...")
+    
+    # Initialize loader
+    loader = IncrementalDataLoader(
+        postgres_conn_id='postgres_analytics',
+        mysql_conn_id='mysql_staging'
+    )
+    
+    # Load new data from MySQL
+    df_new = loader.load_new_data_from_mysql()
+    
+    if df_new.empty:
+        print("⚠️ No data to transfer")
+        return
+    
+    # Detect changes
+    changes = loader.detect_changes(df_new)
+    
+    # Decision: Full or Incremental load
+    change_percentage = changes['change_percentage']
+    FULL_LOAD_THRESHOLD = 50.0  # If >50% changed, do full reload
+    
+    if change_percentage > FULL_LOAD_THRESHOLD:
+        # Full reload
+        print(f"⚠️ {change_percentage:.1f}% of data changed (>{FULL_LOAD_THRESHOLD}%)")
+        print("   Performing FULL load (truncate and reload)...")
+        loader.apply_full_load(df_new)
+        load_type = 'FULL'
+    else:
+        # Incremental load
+        print(f"✅ {change_percentage:.1f}% of data changed (<={FULL_LOAD_THRESHOLD}%)")
+        print("   Performing INCREMENTAL load...")
+        loader.apply_incremental_load(changes, load_type='INCREMENTAL')
+        load_type = 'INCREMENTAL'
+    
+    # Log statistics
+    stats = loader.get_load_statistics(days=7)
+    print("\n📊 Recent Load Statistics:")
+    print(stats.to_string(index=False))
+    
+    # Push to XCom for downstream tasks
+    context['ti'].xcom_push(key='load_type', value=load_type)
+    context['ti'].xcom_push(key='records_inserted', value=loader.load_stats['new'])
+    context['ti'].xcom_push(key='change_percentage', value=change_percentage)
+    
+    print(f"\n✅ Data transfer completed using {load_type} load")
+
+--- THEN UPDATE THE TASK DEFINITION (around line 250) ---
+
+# FIND:
+transfer_data = PythonOperator(
+    task_id='transfer_to_postgres',
+    python_callable=transfer_to_postgres,
+    dag=dag,
+)
+
+# REPLACE WITH:
+transfer_data = PythonOperator(
+    task_id='transfer_to_postgres_incremental',
+    python_callable=transfer_to_postgres_incremental,
+    dag=dag,
+)
+
+--- UPDATE TASK DEPENDENCIES (no change needed, just verify) ---
+
+validate_data >> transfer_data >> dbt_run
+
+================================================================================
+STEP 4: UPDATE DBT TO HANDLE INCREMENTAL DATA
+================================================================================
+
+FILE: dbt_project/models/silver/silver_cleaned_flights.sql
+ACTION: Add filter for active records only
+
+--- FIND THE EXISTING SELECT STATEMENT ---
+
+SELECT
+    *
+FROM {{ source('bronze', 'validated_flights') }}
+WHERE is_valid = TRUE
+
+--- REPLACE WITH ---
+
+SELECT
+    *
+FROM {{ source('bronze', 'validated_flights') }}
+WHERE is_valid = TRUE
+  AND is_active = TRUE  -- Only process active records
+
+--- EXPLANATION ---
+This ensures DBT only processes currently active records, 
+ignoring soft-deleted records from previous loads.
+
+================================================================================
+STEP 5: DEPLOYMENT STEPS
+================================================================================
+
+1. BACKUP YOUR DATABASE
+   ```bash
+   docker exec postgres-analytics pg_dump -U analytics_user flight_analytics > backup_$(date +%Y%m%d).sql
+   ```
+
+2. APPLY SCHEMA CHANGES
+   ```bash
+   docker exec -i postgres-analytics psql -U analytics_user -d flight_analytics < scripts/init_postgres.sql
+   ```
+
+3. VERIFY SCHEMA CHANGES
+   ```bash
+   docker exec -it postgres-analytics psql -U analytics_user -d flight_analytics
+   
+   # Run these queries:
+   \d bronze.validated_flights
+   \d bronze.data_load_metadata
+   
+   # Should see new columns: record_hash, ingestion_timestamp, is_active
+   ```
+
+4. CREATE NEW UTILITY FILE
+   ```bash
+   # Create the file
+   touch dags/utils/incremental_loader.py
+   
+   # Copy the content from STEP 2 above
+   ```
+
+5. UPDATE AIRFLOW DAG
+   ```bash
+   # Edit dags/flight_pipeline_dag.py
+   # Apply changes from STEP 3 above
+   ```
+
+6. UPDATE DBT MODEL
+   ```bash
+   # Edit dbt_project/models/silver/silver_cleaned_flights.sql
+   # Apply changes from STEP 4 above
+   ```
+
+7. RESTART AIRFLOW
+   ```bash
+   docker-compose restart airflow-webserver airflow-scheduler
+   ```
+
+8. VERIFY DAG APPEARS
+   ```bash
+   docker exec -it airflow-webserver airflow dags list | grep flight_price_pipeline
+   ```
+
+9. TRIGGER TEST RUN
+   ```bash
+   docker exec -it airflow-webserver airflow dags trigger flight_price_pipeline
+   ```
+
+10. MONITOR LOGS
+    ```bash
+    docker-compose logs -f airflow-scheduler
+    ```
+
+================================================================================
+STEP 6: VERIFICATION & TESTING
+================================================================================
+
+1. CHECK LOAD METADATA
+   ```sql
+   SELECT * FROM bronze.data_load_metadata ORDER BY load_timestamp DESC LIMIT 5;
+   ```
+   
+   Expected output:
+   - load_type: 'FULL' on first run, 'INCREMENTAL' on subsequent runs
+   - change_percentage: Should decrease over time
+   - execution_time_seconds: Should be lower for incremental loads
+
+2. CHECK RECORD HASHES
+   ```sql
+   SELECT COUNT(*), COUNT(DISTINCT record_hash) 
+   FROM bronze.validated_flights 
+   WHERE is_active = TRUE;
+   ```
+   
+   Expected: Both counts should be equal (unique hashes)
+
+3. CHECK SOFT DELETES
+   ```sql
+   SELECT is_active, COUNT(*) 
+   FROM bronze.validated_flights 
+   GROUP BY is_active;
+   ```
+   
+   Expected: 
+   - TRUE: Current active records
+   - FALSE: Soft-deleted records (if any)
+
+4. COMPARE PERFORMANCE
+   - First run (FULL): ~12 seconds (from your README)
+   - Subsequent runs (INCREMENTAL): ~3-5 seconds (expected)
+
+5. VERIFY DBT TRANSFORMATIONS
+   ```bash
+   docker exec -it airflow-webserver bash -c "cd /opt/airflow/dbt_project && dbt run --profiles-dir ."
+   ```
+   
+   Expected: Should complete successfully with only active records
+
+================================================================================
+STEP 7: MONITORING & MAINTENANCE
+================================================================================
+
+1. DAILY MONITORING QUERY
+   ```sql
+   SELECT 
+       DATE(load_timestamp) as date,
+       load_type,
+       SUM(records_inserted) as total_inserted,
+       SUM(records_deleted) as total_deleted,
+       AVG(change_percentage) as avg_change_pct,
+       AVG(execution_time_seconds) as avg_time_sec
+   FROM bronze.data_load_metadata
+   WHERE load_timestamp >= NOW() - INTERVAL '7 days'
+   GROUP BY DATE(load_timestamp), load_type
+   ORDER BY date DESC;
+   ```
+
+2. CLEANUP OLD INACTIVE RECORDS (Run monthly)
+   ```sql
+   -- Delete records inactive for >90 days
+   DELETE FROM bronze.validated_flights
+   WHERE is_active = FALSE
+     AND ingestion_timestamp < NOW() - INTERVAL '90 days';
+   ```
+
+3. PERFORMANCE TUNING
+   - If incremental loads are slow, check indexes:
+     ```sql
+     REINDEX TABLE bronze.validated_flights;
+     ```
+   
+   - If change detection is slow, consider partitioning:
+     ```sql
+     -- Future enhancement: partition by ingestion_timestamp
+     ```
+
+================================================================================
+ROLLBACK PLAN (If Something Goes Wrong)
+================================================================================
+
+1. RESTORE DATABASE
+   ```bash
+   docker exec -i postgres-analytics psql -U analytics_user -d flight_analytics < backup_YYYYMMDD.sql
+   ```
+
+2. REVERT DAG CHANGES
+   ```bash
+   git checkout dags/flight_pipeline_dag.py
+   ```
+
+3. REMOVE INCREMENTAL LOADER
+   ```bash
+   rm dags/utils/incremental_loader.py
+   ```
+
+4. RESTART AIRFLOW
+   ```bash
+   docker-compose restart airflow-webserver airflow-scheduler
+   ```
+
+================================================================================
+EXPECTED BENEFITS
+================================================================================
+
+Before (Full Load):
+- Transfer time: ~12 seconds
+- Data processed: 57,000 records every time
+- Resource usage: High (full table scan + truncate + reload)
+
+After (Incremental Load):
+- Transfer time: ~3-5 seconds (75% reduction)
+- Data processed: Only changed records (typically <5%)
+- Resource usage: Low (hash comparison + targeted inserts/updates)
+
+Annual Savings (assuming daily runs):
+- Time saved: ~7 seconds × 365 days = 42 minutes/year
+- Resource usage: ~95% reduction in data transfer
+- Database load: Significantly reduced
+
+================================================================================
+TROUBLESHOOTING
+================================================================================
+
+ISSUE: "column record_hash does not exist"
+FIX: Run schema update script (Step 5.2)
+
+ISSUE: "module 'utils.incremental_loader' not found"
+FIX: Ensure file is in dags/utils/ and restart Airflow
+
+ISSUE: Change percentage always 100%
+FIX: Check if record_hash is being calculated correctly
+
+ISSUE: Incremental load slower than full load
+FIX: Check indexes exist, run VACUUM ANALYZE on table
+
+ISSUE: DBT fails after incremental load
+FIX: Verify is_active filter is added to silver model
+
+================================================================================
+NEXT STEPS AFTER IMPLEMENTATION
+================================================================================
+
+1. Monitor for 1 week to ensure stability
+2. Adjust FULL_LOAD_THRESHOLD if needed (currently 50%)
+3. Consider adding email alerts for large change percentages
+4. Implement automated cleanup of old inactive records
+5. Add Grafana dashboard for load statistics visualization
+
+================================================================================
+CONTACT & SUPPORT
+================================================================================
+
+If you encounter issues:
+1. Check Airflow logs: docker-compose logs -f airflow-scheduler
+2. Check PostgreSQL logs: docker-compose logs -f postgres-analytics
+3. Review load metadata: SELECT * FROM bronze.data_load_metadata;
+4. Verify schema: \d bronze.validated_flights
+
+================================================================================
+END OF IMPLEMENTATION GUIDE
+================================================================================

@@ -8,8 +8,12 @@
 /*
     Silver Layer: Cleaned Flights
     
+    UPDATED FOR INCREMENTAL LOADING:
+    - Now filters for is_active = TRUE to exclude soft-deleted records
+    - Only processes currently active records from bronze layer
+    
     This model:
-    1. Filters to only valid records
+    1. Filters to only valid AND active records
     2. Standardizes text fields
     3. Adds derived columns
     4. Handles ANY categorical values flexibly
@@ -24,6 +28,7 @@ WITH source_data AS (
     SELECT *
     FROM {{ source('bronze', 'validated_flights') }}
     WHERE is_valid = TRUE
+      AND is_active = TRUE  -- NEW: Only process active records (incremental loading support)
 ),
 
 cleaned AS (
@@ -193,6 +198,12 @@ cleaned AS (
         mysql_validated_id,
         mysql_loaded_at,
         bronze_loaded_at,
+        
+        -- NEW: Incremental loading lineage
+        record_hash,
+        ingestion_timestamp,
+        
+        -- Current timestamp
         CURRENT_TIMESTAMP AS silver_loaded_at
         
     FROM source_data
